@@ -6,6 +6,7 @@ APP="gsh"
 SSH_DIR="$HOME/.ssh"
 SSH_CONFIG="$SSH_DIR/config"
 GSH_ENV_FILE="$SSH_DIR/.gsh.env"
+KNOWN_HOSTS="$SSH_DIR/known_hosts"
 
 BIN_DIR="$HOME/bin"
 
@@ -55,6 +56,19 @@ prompt_secret() {
     echo
     echo "$v"
   fi
+}
+
+confirm_yn() {
+  local q="$1"
+  local ans
+  while true; do
+    read -r -p "$q (y/n): " ans
+    case "${ans,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
 }
 
 save_gsh_env() {
@@ -137,14 +151,12 @@ sort_config() {
   local tmp
   tmp="$(mktemp)"
 
-  # Header (before first Host)
   awk '
     BEGIN{inhost=0}
     /^Host[[:space:]]+/ {inhost=1}
     inhost==0 {print}
   ' "$SSH_CONFIG" > "$tmp"
 
-  # Blocks sorted by first alias
   awk '
     function flush(){
       if(block!=""){
@@ -170,7 +182,6 @@ sort_config() {
   echo "✅ Sorted ~/.ssh/config"
 }
 
-# --- resolve hostname to fresh IP before connect (avoid relying on DNS cache/TTL behavior)
 is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 is_ipv6() { [[ "$1" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$1" == *:* ]]; }
 is_ip() { is_ipv4 "$1" || is_ipv6 "$1"; }
@@ -199,6 +210,75 @@ resolve_fresh_ip() {
   echo "$ip"
 }
 
+ssh_try_connect() {
+  local alias="$1"
+  local hostname="${2:-}"
+  local ip="${3:-}"
+
+  local err tmp
+  tmp="$(mktemp)"
+
+  set +e
+  ssh "$alias" 2> "$tmp"
+  local rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  err="$(cat "$tmp")"
+  rm -f "$tmp"
+
+  # Detect host key changed
+  if grep -q "REMOTE HOST IDENTIFICATION HAS CHANGED" <<<"$err" || \
+     grep -q "Host key verification failed" <<<"$err"; then
+
+    echo "⚠️  SSH Host Key changed for: $alias"
+    [[ -n "$hostname" ]] && echo "   HostKeyAlias/Host: $hostname"
+    [[ -n "$ip" ]] && echo "   Target IP: $ip"
+    echo
+    echo "This usually happens after reinstall/reimage, or IP/host was reassigned."
+    echo "If you trust this server, I can remove old keys and retry."
+    echo
+
+    if confirm_yn "Remove old known_hosts entries and retry?"; then
+      # Remove by alias, hostname, ip, and also [ip]:port if possible
+      # We do NOT delete unrelated lines; ssh-keygen -R surgically removes matching entries.
+      echo "🧹 Cleaning known_hosts entries..."
+
+      # Alias itself may exist
+      ssh-keygen -R "$alias" >/dev/null 2>&1 || true
+
+      if [[ -n "$hostname" ]]; then
+        ssh-keygen -R "$hostname" >/dev/null 2>&1 || true
+      fi
+      if [[ -n "$ip" ]]; then
+        ssh-keygen -R "$ip" >/dev/null 2>&1 || true
+
+        # Try [ip]:port form if we can read port from ssh -G
+        local port
+        port="$(ssh -G "$alias" 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+        if [[ -n "${port:-}" ]]; then
+          ssh-keygen -R "[$ip]:$port" >/dev/null 2>&1 || true
+        fi
+      fi
+
+      echo "✅ Removed old keys. Retrying connection..."
+      # retry once
+      exec ssh "$alias"
+    else
+      echo "❌ Not changed. Connection aborted (to keep you safe)."
+      return 255
+    fi
+  fi
+
+  # Not a hostkey error → show original stderr
+  echo "$err" >&2
+  return "$rc"
+}
+
 connect_with_resolve_if_needed() {
   local alias="$1"
 
@@ -210,20 +290,30 @@ connect_with_resolve_if_needed() {
   fi
 
   if [[ "$RESOLVE_HOST_BEFORE_CONNECT" != "1" ]] || is_ip "$hostname"; then
-    exec ssh "$alias"
+    ssh_try_connect "$alias" "$hostname" ""
+    exit $?
   fi
 
   local ip
   ip="$(resolve_fresh_ip "$hostname" "$RESOLVE_PREFER")"
   if [[ -z "$ip" ]]; then
-    exec ssh "$alias"
+    ssh_try_connect "$alias" "$hostname" ""
+    exit $?
+  fi
+  
+  local tmp_alias="__gsh_tmp_${alias}_$$"
+
+  set +e
+  ssh -o HostName="$ip" -o HostKeyAlias="$hostname" -o CheckHostIP=yes "$alias"
+  local rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    exit 0
   fi
 
-  exec ssh \
-    -o HostName="$ip" \
-    -o HostKeyAlias="$hostname" \
-    -o CheckHostIP=yes \
-    "$alias"
+  ssh_try_connect "$alias" "$hostname" "$ip"
+  exit $?
 }
 
 cmd_init() {
@@ -486,4 +576,3 @@ main() {
 }
 
 main "$@"
-
