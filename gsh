@@ -291,7 +291,7 @@ ssh_try_connect() {
 
   err="$(cat "$tmp")"; rm -f "$tmp"
 
-  if grep -q "REMOTE HOST IDENTIFICATION HAS CHANGED\|Host key verification failed" <<<"$err"; then
+  if echo "$err" | grep -q "REMOTE HOST IDENTIFICATION HAS CHANGED\|Host key verification failed"; then
     echo
     warn "SSH host key changed for: $(_c "$C_BOLD")$alias$(_c "$C_RESET")"
     [[ -n "$hostname" ]] && info "Hostname : $hostname"
@@ -478,16 +478,19 @@ cmd_rm() {
 # ── cmd: ls ──────────────────────────────────────────────────────────────────
 
 cmd_ls() {
-  local hosts
-  mapfile -t hosts < <(list_hosts)
+  local host_list
+  host_list="$(list_hosts)"
 
-  if [[ ${#hosts[@]} -eq 0 ]]; then
+  if [[ -z "$host_list" ]]; then
     info "No hosts configured. Use 'gsh add' to add one."
     return
   fi
 
-  divider "Hosts (${#hosts[@]})"
-  for h in "${hosts[@]}"; do
+  local count
+  count="$(echo "$host_list" | wc -l | tr -d ' ')"
+  divider "Hosts ($count)"
+
+  echo "$host_list" | while IFS= read -r h; do
     local hostname port user tags_str=""
     hostname="$(get_host_field "$h" "hostname")"
     port="$(get_host_field     "$h" "port")"
@@ -495,7 +498,6 @@ cmd_ls() {
     [[ -z "$port" ]] && port="22"
     [[ -z "$user" ]] && user="root"
 
-    # Tags
     if [[ -f "$GSH_TAGS_FILE" ]]; then
       local raw
       raw="$(awk -v h="$h" '$1==h{$1=""; print}' "$GSH_TAGS_FILE" | xargs)"
