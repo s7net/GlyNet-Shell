@@ -529,14 +529,8 @@ cmd_ls() {
   divider "Hosts ($count)"
   echo
 
-  # Header
-  printf "  ${C_BOLD}%-20s  %-8s  %-28s  %-16s  %s${C_RESET}\n" \
-    "ALIAS" "PORT" "USER@HOST" "IDENTITY" "TAGS"
-  printf "${C_DIM}  %-20s  %-8s  %-28s  %-16s  %s${C_RESET}\n" \
-    "--------------------" "--------" "----------------------------" "----------------" "--------"
-
   echo "$host_list" | while IFS= read -r h; do
-    local hostname port user identity tags_str="" identity_short=""
+    local hostname port user identity tags_str="" identity_short="" resolved_ip=""
     hostname="$(get_host_field  "$h" "hostname")"
     port="$(get_host_field      "$h" "port")"
     user="$(get_host_field      "$h" "user")"
@@ -545,38 +539,48 @@ cmd_ls() {
     [[ -z "$user"     ]] && user="root"
     [[ -z "$identity" ]] && identity="$DEFAULT_IDENTITY"
 
-    # Shorten identity path: show only filename without extension
     identity_short="$(basename "${identity%.pub}")"
 
-    # Resolve live IP if hostname is not already an IP
-    local resolved_ip=""
-    if [[ "$RESOLVE_HOST_BEFORE_CONNECT" == "1" ]] && ! is_ip "$hostname"; then
+    # Resolve IP for hostnames (not raw IPs)
+    if ! is_ip "$hostname"; then
       resolved_ip="$(resolve_fresh_ip "$hostname" "$RESOLVE_PREFER" 2>/dev/null || true)"
     fi
 
     # Tags
     if [[ -f "$GSH_TAGS_FILE" ]]; then
       local raw
-      raw="$(awk -v h="$h" '$1==h{$1=""; print}' "$GSH_TAGS_FILE" | xargs)"
-      [[ -n "$raw" ]] && tags_str="${C_DIM}[${raw}]${C_RESET}"
+      raw="$(awk -v hh="$h" '$1==hh{$1=""; print}' "$GSH_TAGS_FILE" | xargs)"
+      [[ -n "$raw" ]] && tags_str="$raw"
     fi
 
-    local user_host="${user}@${hostname}:${port}"
-    printf "  ${C_BOLD}%-20s${C_RESET}  ${C_DIM}%-8s${C_RESET}  %-28s  ${C_DIM}%-16s${C_RESET}  %b\n" \
-      "$h" "$port" "$user_host" "$identity_short" "$tags_str"
+    # ── Row: alias  user@host:port  key  [tags]
+    #   alias (bold, fixed 12 chars) │ connection string │ key (dim)
+    local conn="${user}@${hostname}"
+    [[ "$port" != "22" ]] && conn="${conn}:${port}"
 
-    # Show resolved IP on a second line if available and different from hostname
+    printf "  ${C_BOLD}%-14s${C_RESET}  ${C_CYAN}%s${C_RESET}" "$h" "$conn"
+
+    # Port badge only when non-default
+    [[ "$port" != "22" ]] || printf "  ${C_DIM}:22${C_RESET}"
+
+    # Resolved IP inline (only for hostnames)
     if [[ -n "$resolved_ip" && "$resolved_ip" != "$hostname" ]]; then
-      printf "  ${C_DIM}%-20s  %-8s  → %-26s${C_RESET}\n" "" "" "$resolved_ip"
+      printf "  ${C_DIM}→ %s${C_RESET}" "$resolved_ip"
     fi
-  done
-  echo
 
-  # Footer: key summary
+    echo
+
+    # Second line: key + tags (indented under alias)
+    local line2="  ${C_DIM}              🔑 ${identity_short}${C_RESET}"
+    [[ -n "$tags_str" ]] && line2="${line2}  ${C_DIM}[${tags_str}]${C_RESET}"
+    printf "%b\n" "$line2"
+
+    echo
+  done
+
   local key_count=0
   key_count="$(find "$SSH_DIR" -maxdepth 2 -name "*.pub" 2>/dev/null | wc -l | tr -d ' ')"
-  printf "  ${C_DIM}Keys available: %s  |  Config: %s${C_RESET}\n" \
-    "$key_count" "$SSH_CONFIG"
+  printf "  ${C_DIM}%d hosts  ·  %d keys  ·  %s${C_RESET}\n" "$count" "$key_count" "$SSH_CONFIG"
   echo
 }
 
@@ -1224,54 +1228,52 @@ cmd_restore() {
 # ── Usage ─────────────────────────────────────────────────────────────────────
 
 usage() {
-  cat <<EOF
-${C_BOLD}GlyNet Shell (gsh) v${VERSION}${C_RESET} — SSH connection manager
+  local b="$C_BOLD" r="$C_RESET" d="$C_DIM" c="$C_CYAN"
+  printf "${b}GlyNet Shell (gsh) v%s${r} — SSH connection manager\n\n" "$VERSION"
 
-${C_BOLD}CONNECT${C_RESET}
-  gsh ${C_BOLD}<name>${C_RESET}                          Connect to host
-  gsh exec   ${C_BOLD}<name> <cmd>${C_RESET}             Run command on remote host
-  gsh tunnel ${C_BOLD}<name> <lp>:<rh>:<rp>${C_RESET}    Local port-forward
-  gsh copy   ${C_BOLD}<src> <dst>${C_RESET}              SCP file copy (host:path)
+  printf "${b}CONNECT${r}\n"
+  printf "  gsh ${b}<name>${r}                          Connect to host\n"
+  printf "  gsh exec   ${b}<name> <cmd>${r}             Run command on remote host\n"
+  printf "  gsh tunnel ${b}<name> <lp>:<rh>:<rp>${r}    Local port-forward\n"
+  printf "  gsh copy   ${b}<src> <dst>${r}              SCP file copy (host:path)\n\n"
 
-${C_BOLD}MANAGE HOSTS${C_RESET}
-  gsh add       ${C_DIM}[name]${C_RESET}               Add a host (interactive, key picker)
-  gsh update    ${C_DIM}[name]${C_RESET}               Update a host (key picker)
-  gsh rm        ${C_BOLD}<name>${C_RESET}               Remove a host
-  gsh rename    ${C_BOLD}<old> <new>${C_RESET}          Rename host alias
-  gsh duplicate ${C_BOLD}<src> <new>${C_RESET}          Clone a host entry
-  gsh ls                               List all hosts (full details)
-  gsh info      ${C_BOLD}<name>${C_RESET}               Show full host info + resolved IP
-  gsh sort                             Sort config alphabetically
-  gsh export    ${C_DIM}[name]${C_RESET}               Print config to stdout
-  gsh import    ${C_BOLD}<file>${C_RESET}               Import hosts from config file
+  printf "${b}MANAGE HOSTS${r}\n"
+  printf "  gsh add       ${d}[name]${r}               Add a host (interactive, key picker)\n"
+  printf "  gsh update    ${d}[name]${r}               Update a host (key picker)\n"
+  printf "  gsh rm        ${b}<name>${r}               Remove a host\n"
+  printf "  gsh rename    ${b}<old> <new>${r}          Rename host alias\n"
+  printf "  gsh duplicate ${b}<src> <new>${r}          Clone a host entry\n"
+  printf "  gsh ls                               List all hosts (full details)\n"
+  printf "  gsh info      ${b}<name>${r}               Show full host info + resolved IP\n"
+  printf "  gsh sort                             Sort config alphabetically\n"
+  printf "  gsh export    ${d}[name]${r}               Print config to stdout\n"
+  printf "  gsh import    ${b}<file>${r}               Import hosts from config file\n\n"
 
-${C_BOLD}KEYS${C_RESET}
-  gsh key show                         List all local SSH keys
-  gsh key add                          Generate a new SSH key
-  gsh key fingerprint ${C_DIM}[keypath]${C_RESET}      Show key fingerprint
-  gsh copy-id  ${C_BOLD}<name>${C_RESET}               Push public key to host
+  printf "${b}KEYS${r}\n"
+  printf "  gsh key show                         List all local SSH keys\n"
+  printf "  gsh key add                          Generate a new SSH key\n"
+  printf "  gsh key fingerprint ${d}[keypath]${r}      Show key fingerprint\n"
+  printf "  gsh copy-id  ${b}<name>${r}               Push public key to host\n\n"
 
-${C_BOLD}DIAGNOSTICS${C_RESET}
-  gsh ping     ${C_BOLD}<name>${C_RESET}               Ping host
-  gsh health   ${C_BOLD}<name>${C_RESET}               Full check: ping / port / ssh / uptime
-  gsh test-all                         Test SSH to all hosts
-  gsh logs     ${C_BOLD}<name>${C_RESET} ${C_DIM}[lines]${C_RESET}       Tail remote SSH auth log
+  printf "${b}DIAGNOSTICS${r}\n"
+  printf "  gsh ping     ${b}<name>${r}               Ping host\n"
+  printf "  gsh health   ${b}<name>${r}               Full check: ping / port / ssh / uptime\n"
+  printf "  gsh test-all                         Test SSH to all hosts\n"
+  printf "  gsh logs     ${b}<name>${r} ${d}[lines]${r}       Tail remote SSH auth log\n\n"
 
-${C_BOLD}TAGS${C_RESET}
-  gsh tag      ${C_BOLD}<name> <tag>${C_RESET}          Tag a host
-  gsh untag    ${C_BOLD}<name>${C_RESET} ${C_DIM}[tag]${C_RESET}           Remove tag (or all tags)
-  gsh ls-tags  ${C_DIM}[tag]${C_RESET}                List tags / hosts by tag
+  printf "${b}TAGS${r}\n"
+  printf "  gsh tag      ${b}<name> <tag>${r}          Tag a host\n"
+  printf "  gsh untag    ${b}<name>${r} ${d}[tag]${r}           Remove tag (or all tags)\n"
+  printf "  gsh ls-tags  ${d}[tag]${r}                List tags / hosts by tag\n\n"
 
-${C_BOLD}BACKUP${C_RESET}
-  gsh backup                           Backup ~/.ssh + ~/bin (encrypted zip)
-  gsh restore  ${C_BOLD}<backup.zip>${C_RESET}          Restore from backup
+  printf "${b}BACKUP${r}\n"
+  printf "  gsh backup                           Backup ~/.ssh + ~/bin (encrypted zip)\n"
+  printf "  gsh restore  ${b}<backup.zip>${r}          Restore from backup\n\n"
 
-${C_BOLD}CONFIG${C_RESET}
-  gsh init                             Configure gsh settings
-  gsh version                          Show version
-
-  Config: ${C_DIM}~/.ssh/.gsh.env${C_RESET}
-EOF
+  printf "${b}CONFIG${r}\n"
+  printf "  gsh init                             Configure gsh settings\n"
+  printf "  gsh version                          Show version\n\n"
+  printf "  Config: ${d}~/.ssh/.gsh.env${r}\n"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
